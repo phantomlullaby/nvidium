@@ -55,7 +55,11 @@ public class NvidiumWorldRenderer {
 
         update_allowed_memory();
         //this.sectionManager = new SectionManager(device, max_geometry_memory*1024*1024, uploadStream, 150, 24, CompactChunkVertex.STRIDE);
-        this.sectionManager = new SectionManager(device, max_geometry_memory*1024*1024, uploadStream, Nvidium.config.use_sodium_vertex_format ? ChunkMeshFormats.COMPACT.getVertexFormat().getVertexSize() : NvidiumCompactChunkVertex.STRIDE, this);
+        this.sectionManager = new SectionManager(device, max_geometry_memory*1024*1024, uploadStream, Nvidium.VERTEX_STRIDE, this);
+        if (!Nvidium.SUPPORTS_PERSISTENT_SPARSE_ADDRESSABLE_BUFFER) {
+            //The terrain buffer can come out smaller than asked for, see BufferArena
+            max_geometry_memory = Math.min(max_geometry_memory, sectionManager.terrainAreana.getMemoryUsed() / (1024 * 1024));
+        }
         this.renderPipeline = new RenderPipeline(device, uploadStream, downloadStream, sectionManager);
     }
 
@@ -87,6 +91,10 @@ public class NvidiumWorldRenderer {
         }
     }
 
+    public void renderShadow(TerrainRenderPass pass, Viewport viewport, FogParameters fogParameters, ChunkRenderMatrices matrices, double x, double y, double z) {
+        renderPipeline.renderShadow(pass, viewport, fogParameters, matrices, x, y, z);
+    }
+
     public void renderTranslucent(TerrainRenderPass pass, FrontendRenderPass renderPass, GpuSampler terrainSampler, OitStage stage) {
         this.renderPipeline.renderTranslucent(pass, renderPass, terrainSampler, stage);
     }
@@ -100,7 +108,7 @@ public class NvidiumWorldRenderer {
             this.sectionManager.uploadChunkBuildResult(chunkBuildOutput);
         }
         if (buildOutput instanceof ChunkSortOutput chunkSortOutput && chunkSortOutput.containsNewIndexData() &&
-                Nvidium.config.translucency_sorting_level == TranslucencySortingLevel.SODIUM) {
+                Nvidium.translucencySortingLevel() == TranslucencySortingLevel.SODIUM) {
             this.sectionManager.uploadChunkSort(chunkSortOutput);
         }
     }
@@ -128,6 +136,11 @@ public class NvidiumWorldRenderer {
             max_geometry_memory = (glGetInteger(GL_GPU_MEMORY_INFO_CURRENT_AVAILABLE_VIDMEM_NVX) / 1024) + (sectionManager==null?0:sectionManager.terrainAreana.getMemoryUsed()/(1024*1024));
             max_geometry_memory -= 1024;//Minus 1gb of vram
             max_geometry_memory = Math.max(2048, max_geometry_memory);//Minimum 2 gb of vram
+            if (!Nvidium.SUPPORTS_PERSISTENT_SPARSE_ADDRESSABLE_BUFFER) {
+                //The fallback buffer is allocated at full size up front. On linux (driver 615, RTX 4070 super) rendering from a
+                // buffer bigger than 2 GiB was measured 4-8x slower than from a 2 GiB one, for nvidium's own shaders and the Iris path
+                max_geometry_memory = Math.min(max_geometry_memory, 2048);
+            }
         } else {
             max_geometry_memory = Nvidium.config.max_geometry_memory;
         }

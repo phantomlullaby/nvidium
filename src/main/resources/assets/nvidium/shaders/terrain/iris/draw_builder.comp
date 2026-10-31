@@ -1,0 +1,197 @@
+#version 460
+
+#extension GL_ARB_shading_language_include : enable
+#extension GL_NV_gpu_shader5 : require
+#extension GL_NV_shader_buffer_load : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+// Turns nvidium's visible section lists, one (section count, regionId << 8) command per region, into indexed multi draw
+// commands for the shader pack programs. Drawn with a shared quad index buffer, one draw per contiguous run of visible
+// faces of a section (or all translucent quads of a section), and a per draw camera relative region origin.
+// Run as three passes (PASS_COUNT, PASS_SCAN, PASS_WRITE) so the draws keep exactly the order of the input commands.
+
+#import <nvidium:occlusion/scene.glsl>
+
+struct DrawCommand {
+    uint count;
+    uint instanceCount;
+    uint firstIndex;
+    int baseVertex;
+    uint baseInstance;
+};
+
+#define MODE_TRANSLUCENT 1u
+#define MODE_NO_FACE_CULLING 2u
+//Bits 2-3 select the component of sectionIndices holding the section slots
+#define MODE_COMPONENT_SHIFT 2u
+//Read the section slots from sectionSlots (one byte each, filled on the cpu) instead of sectionIndices
+#define MODE_SLOT_LIST 16u
+
+uniform uvec2* inCommands;
+uniform uint8_t* sectionSlots;
+uniform uint commandCount;
+//Per command: number of draws after PASS_COUNT, index of its first draw after PASS_SCAN
+uniform uint* commandDraws;
+uniform DrawCommand* outCommands;
+uniform vec4* outOffsets;
+uniform uint* outDrawCount;
+uniform uint maxDraws;
+uniform uint maxQuadsPerDraw;
+uniform uint mode;
+
+#ifdef PASS_SCAN
+layout(local_size_x = 1024) in;
+
+shared uint partials[1024];
+
+void main() {
+    uint thread = gl_LocalInvocationID.x;
+    uint perThread = (commandCount + 1023u) / 1024u;
+    uint begin = min(thread * perThread, commandCount);
+    uint end = min(begin + perThread, commandCount);
+
+    uint sum = 0u;
+    for (uint i = begin; i < end; i++) {
+        sum += commandDraws[i];
+    }
+    partials[thread] = sum;
+    barrier();
+
+    for (uint offset = 1u; offset < 1024u; offset <<= 1u) {
+        uint value = thread >= offset ? partials[thread - offset] : 0u;
+        barrier();
+        partials[thread] += value;
+        barrier();
+    }
+
+    uint running = partials[thread] - sum;
+    for (uint i = begin; i < end; i++) {
+        uint count = commandDraws[i];
+        commandDraws[i] = running;
+        running += count;
+    }
+    if (thread == 1023u) {
+        *outDrawCount = min(partials[1023], maxDraws);
+    }
+}
+
+#else
+layout(local_size_x = 256) in;
+
+shared uint subgroupTotals[32];
+
+DrawCommand draws[4];
+
+void emit(inout uint count, uint baseQuad, uint quads) {
+    draws[count++] = DrawCommand(min(quads, maxQuadsPerDraw) * 6u, 1u, 0u, int(baseQuad * 4u), 0u);
+}
+
+//Fills draws for one section, returns how many
+uint sectionDraws(uint sectionId, out vec3 offset) {
+    offset = vec3(0);
+    ivec4 header = sectionData[sectionId].header;
+    if (sectionEmpty(header) || (header.y & (1 << 17)) != 0) {
+        return 0u;
+    }
+    ivec3 chunk = ivec3(header.xyz) >> 8;
+    chunk.y &= 0x1ff;
+    chunk.y <<= 32 - 9;
+    chunk.y >>= 32 - 9;
+
+    //The vertices hold their section's position within its sodium region (same 8x4x8 grid as nvidium's regions),
+    // so the shader pack gets the region origin like it would from sodium
+    offset = vec3(((chunk & ivec3(~7, ~3, ~7)) - chunkPosition.xyz) << 4) + subchunkOffset.xyz;
+    uint base = uint(header.w);
+
+    uint count = 0u;
+    if ((mode & MODE_TRANSLUCENT) != 0u) {
+        int quads = sectionData[sectionId].tranlucentQuadCount;
+        if (quads > 0) {
+            emit(count, base, uint(quads));
+        }
+        return count;
+    }
+
+    ivec3 relative = chunk - chunkPosition.xyz;
+    if ((mode & MODE_NO_FACE_CULLING) != 0u || !useBlockFaceCulling()) {
+        relative = ivec3(0);
+    }
+    uvec4 ranges = uvec4(sectionData[sectionId].renderRanges);
+    //Face ranges are stored one after another in this order, see SodiumResultCompatibility and terrain/task_common.glsl
+    uint faceQuads[7] = uint[7](ranges.x & 0xFFFFu, ranges.x >> 16u, ranges.y & 0xFFFFu, ranges.y >> 16u,
+                                ranges.z & 0xFFFFu, ranges.z >> 16u, ranges.w & 0xFFFFu);
+    bool faceVisible[7] = bool[7](relative.x <= 0, relative.y <= 0, relative.z <= 0,
+                                  relative.x >= 0, relative.y >= 0, relative.z >= 0, true);
+
+    uint position = base + ((ranges.w >> 16u) & 0xFFFFu);
+    uint runStart = position;
+    uint runQuads = 0u;
+    for (uint face = 0u; face < 7u; face++) {
+        uint quads = faceQuads[face];
+        if (faceVisible[face]) {
+            if (runQuads == 0u) {
+                runStart = position;
+            }
+            runQuads += quads;
+        } else if (quads != 0u) {
+            if (runQuads != 0u) {
+                emit(count, runStart, runQuads);
+            }
+            runQuads = 0u;
+        }
+        position += quads;
+    }
+    if (runQuads != 0u) {
+        emit(count, runStart, runQuads);
+    }
+    return count;
+}
+
+void main() {
+    uint commandIndex = gl_WorkGroupID.x;
+    uvec2 command = inCommands[commandIndex];
+    uint slot = gl_LocalInvocationID.x;
+
+    uint count = 0u;
+    vec3 offset = vec3(0);
+    if (slot < command.x) {
+        uint sectionSlot;
+        if ((mode & MODE_SLOT_LIST) != 0u) {
+            sectionSlot = uint(sectionSlots[command.y + slot]);
+        } else {
+            sectionSlot = uint(sectionIndices[command.y + slot][(mode >> MODE_COMPONENT_SHIFT) & 3u]);
+        }
+        uint sectionId = (command.y & ~0xFFu) | sectionSlot;
+        count = sectionDraws(sectionId, offset);
+    }
+
+    //Exclusive prefix sum of the draw counts over the workgroup
+    uint inclusive = subgroupInclusiveAdd(count);
+    if (gl_SubgroupInvocationID == gl_SubgroupSize - 1u) {
+        subgroupTotals[gl_SubgroupID] = inclusive;
+    }
+    barrier();
+    uint prefix = inclusive - count;
+    for (uint i = 0u; i < gl_SubgroupID; i++) {
+        prefix += subgroupTotals[i];
+    }
+
+#ifdef PASS_COUNT
+    if (slot == gl_WorkGroupSize.x - 1u) {
+        commandDraws[commandIndex] = prefix + count;
+    }
+#else
+    uint first = commandDraws[commandIndex] + prefix;
+    for (uint i = 0u; i < count; i++) {
+        uint index = first + i;
+        if (index < maxDraws) {
+            DrawCommand draw = draws[i];
+            draw.baseInstance = index;
+            outCommands[index] = draw;
+            outOffsets[index] = vec4(offset, 0.0);
+        }
+    }
+#endif
+}
+#endif

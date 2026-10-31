@@ -16,7 +16,8 @@ public class MixinCamera {
             )
     )
     private float nvidium$modifyDepthFar(float original) {
-        if (Nvidium.IS_ENABLED) {
+        //Shader packs linearize depth with the vanilla far plane (Iris' far uniform), so it must not change with them
+        if (Nvidium.IS_ENABLED && !Nvidium.IRIS_MODE) {
             return 16 * 512f;
         }
         return original;

@@ -1,6 +1,8 @@
 package me.cortex.nvidium;
 
 import me.cortex.nvidium.config.NvidiumConfig;
+import me.cortex.nvidium.config.TranslucencySortingLevel;
+import me.cortex.nvidium.sodiumCompat.NvidiumCompactChunkVertex;
 import net.fabricmc.loader.api.FabricLoader;
 import net.fabricmc.loader.api.ModContainer;
 import net.minecraft.util.Util;
@@ -16,6 +18,12 @@ public class Nvidium {
     public static boolean IS_DEBUG = System.getProperty("nvidium.isDebug", "false").equals("TRUE");
     public static boolean SUPPORTS_PERSISTENT_SPARSE_ADDRESSABLE_BUFFER = true;
     public static boolean FORCE_DISABLE = false;
+    //Set when the current world renderer draws terrain with the active Iris shader pack programs
+    public static boolean IRIS_MODE = false;
+    //Vertex stride of the chunk mesh format sodium is currently building with
+    public static volatile int VERTEX_STRIDE = NvidiumCompactChunkVertex.STRIDE;
+    //True when the chunk mesh format uses sodium's (and Iris's) position/texture encoding
+    public static volatile boolean SODIUM_VERTEX_LAYOUT = false;
 
     public static NvidiumConfig config = NvidiumConfig.loadOrCreate();
 
@@ -24,6 +32,16 @@ public class Nvidium {
         var version = mod.getMetadata().getVersion().getFriendlyString();
         var commit = mod.getMetadata().getCustomValue("commit").getAsString();
         MOD_VERSION = version+"-"+commit;
+    }
+
+    //Iris mode draws translucent quads in their stored order, so sodium's sort data (an index list per section) is not usable.
+    // Sort the quads when the section is built instead, like the sections sorting level does
+    public static TranslucencySortingLevel translucencySortingLevel() {
+        var level = config.translucency_sorting_level;
+        if (IRIS_MODE && (level == TranslucencySortingLevel.SODIUM || level == TranslucencySortingLevel.QUADS)) {
+            return TranslucencySortingLevel.SECTIONS;
+        }
+        return level;
     }
 
     public static void checkSystemIsCapable() {

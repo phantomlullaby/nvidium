@@ -72,6 +72,7 @@ repositories {
         name = "CaffeineMC"
         url = "https://maven.caffeinemc.net/releases" // or /snapshots
     }
+    mavenCentral()
 }
 
 dependencies {
@@ -93,6 +94,12 @@ dependencies {
     //modImplementation "maven.modrinth:c2me-fabric:0.2.0+alpha.10.49+1.19.4"
     //modImplementation "maven.modrinth:chunks-fade-in:v1.0.3-1.19.4"
     //modImplementation "maven.modrinth:immersiveportals:v2.7.3-mc1.19.4"
-    compileOnly "maven.modrinth:iris:1.11.6+26.3-fabric"
+    compileOnly "maven.modrinth:iris:1.11.7+26.3-fabric"
+    // Bundled inside Iris as jar-in-jar, used to rewrite Iris' patched terrain vertex shaders into mesh shaders
+    compileOnly "io.github.douira:glsl-transformer:3.0.0-pre3"
+    compileOnly "org.antlr:antlr4-runtime:4.13.1"
+    // Vivecraft and the LWJGL OpenVR bindings it bundles, for the VR hooks (only applied when Vivecraft is installed)
+    compileOnly "maven.modrinth:vivecraft:26.3-1.3.17-fabric"
+    compileOnly "org.lwjgl:lwjgl-openvr:3.3.6"
 }
 

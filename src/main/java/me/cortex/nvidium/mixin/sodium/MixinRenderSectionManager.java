@@ -2,7 +2,9 @@ package me.cortex.nvidium.mixin.sodium;
 
 import me.cortex.nvidium.Nvidium;
 import me.cortex.nvidium.NvidiumWorldRenderer;
+import me.cortex.nvidium.iris.IrisCompat;
 import me.cortex.nvidium.sodiumCompat.*;
+import me.cortex.nvidium.util.BufferArena;
 import net.caffeinemc.mods.sodium.client.render.chunk.*;
 import net.caffeinemc.mods.sodium.client.render.chunk.region.RenderRegionManager;
 import net.caffeinemc.mods.sodium.client.render.chunk.translucent_sorting.SortBehavior;
@@ -29,7 +31,8 @@ public class MixinRenderSectionManager implements INvidiumWorldRendererGetter {
 
     @Unique
     private static void updateNvidiumIsEnabled() {
-        Nvidium.IS_ENABLED = (!Nvidium.FORCE_DISABLE) && Nvidium.IS_COMPATIBLE && IrisCheck.checkIrisShouldDisable();
+        Nvidium.IS_ENABLED = (!Nvidium.FORCE_DISABLE) && Nvidium.IS_COMPATIBLE && IrisCheck.canRenderWithIris();
+        Nvidium.IRIS_MODE = Nvidium.IS_ENABLED && IrisCheck.isShaderPackInUse();
     }
 
     @Inject(method = "<init>", at = @At("TAIL"))
@@ -40,14 +43,22 @@ public class MixinRenderSectionManager implements INvidiumWorldRendererGetter {
                 throw new IllegalStateException("Cannot have multiple world renderers");
             renderer = new NvidiumWorldRenderer();
             ((INvidiumWorldRendererSetter)regions).setWorldRenderer(renderer);
+        } else {
+            BufferArena.releaseSpareBuffer();
         }
     }
 
     @ModifyArg(method = "<init>", at = @At(value = "INVOKE", target = "Lnet/caffeinemc/mods/sodium/client/render/chunk/compile/executor/ChunkBuilder;<init>(Lnet/minecraft/client/multiplayer/ClientLevel;Lnet/caffeinemc/mods/sodium/client/render/chunk/vertex/format/ChunkVertexType;)V", remap = true), index = 1)
     private ChunkVertexType modifyVertexType(ChunkVertexType vertexType) {
         updateNvidiumIsEnabled();
-        if (Nvidium.IS_ENABLED && !Nvidium.config.use_sodium_vertex_format) {
-            return NvidiumCompactChunkVertex.INSTANCE;
+        //With a shader pack the pack's programs need Iris' extended vertex format, so keep whatever Iris chose
+        if (Nvidium.IS_ENABLED && !Nvidium.IRIS_MODE && !Nvidium.config.use_sodium_vertex_format) {
+            vertexType = NvidiumCompactChunkVertex.INSTANCE;
+        }
+        Nvidium.VERTEX_STRIDE = vertexType.getVertexFormat().getVertexSize();
+        Nvidium.SODIUM_VERTEX_LAYOUT = vertexType != NvidiumCompactChunkVertex.INSTANCE;
+        if (Nvidium.IRIS_MODE) {
+            IrisCompat.setChunkVertexFormat(vertexType.getVertexFormat());
         }
         return vertexType;
     }

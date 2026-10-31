@@ -22,13 +22,13 @@ public class ShaderLoader {
         }
 
 
-        if (Nvidium.config.translucency_sorting_level.ordinal() >= TranslucencySortingLevel.SECTIONS.ordinal()) {
+        if (Nvidium.translucencySortingLevel().ordinal() >= TranslucencySortingLevel.SECTIONS.ordinal()) {
             builder.define("TRANSLUCENCY_SORTING_SECTIONS");
         }
-        if (Nvidium.config.translucency_sorting_level == TranslucencySortingLevel.QUADS) {
+        if (Nvidium.translucencySortingLevel() == TranslucencySortingLevel.QUADS) {
             builder.define("TRANSLUCENCY_SORTING_QUADS");
         }
-        if (Nvidium.config.translucency_sorting_level == TranslucencySortingLevel.SODIUM) {
+        if (Nvidium.translucencySortingLevel() == TranslucencySortingLevel.SODIUM) {
             builder.define("TRANSLUCENCY_SORTING_SODIUM");
         }
 

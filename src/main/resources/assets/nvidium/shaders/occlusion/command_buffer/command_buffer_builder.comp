@@ -23,8 +23,20 @@ bool hasTranslucentData(uint sectionId) {
     return sectionData[sectionId].tranlucentQuadCount > 0;
 }
 
+uniform uint fixOccludedHistory;
+
 void main() {
     if (regionVisibility[gl_WorkGroupID.x] == uint8_t(0)) {
+        if (fixOccludedHistory != 0u) {
+            //The section raster skips occluded regions, so their sections did not shift their visibility history this frame.
+            // Shift in "not visible": otherwise a section seen two frames ago passes for one drawn last frame, and when the
+            // region shows up again the temporal pass skips it while the primary pass did not draw it either
+            uint occludedBase = uint(regionIndicies[gl_WorkGroupID.x]) << 8;
+            for (uint i = 0; i < 8; i++) {
+                uint index = occludedBase + gl_LocalInvocationID.x * 8 + i;
+                sectionVisibility[index] = uint8_t(uint(sectionVisibility[index]) << 1);
+            }
+        }
         if (subgroupElect()) {
             terrainCommandBuffer[gl_WorkGroupID.x] = uvec2(0);
             translucencyCommandBuffer[(uint(regionCount) - gl_WorkGroupID.x) - 1] = uvec2(0);

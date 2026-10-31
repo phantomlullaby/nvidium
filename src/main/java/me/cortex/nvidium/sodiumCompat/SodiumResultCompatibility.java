@@ -16,13 +16,13 @@ import org.lwjgl.system.MemoryUtil;
 
 public class SodiumResultCompatibility {
 
-    public static RepackagedSectionOutput repackage(ChunkBuildOutput result, int formatSize) {
+    public static RepackagedSectionOutput repackage(ChunkBuildOutput result, int formatSize, boolean sodiumLayout) {
         int geometryBytes = result.meshes.values().stream().mapToInt(a->a.getVertexData().getLength()).sum();
         var output = new NativeBuffer(geometryBytes);
         var offsets = new int[8];
         var min = new Vector3i(2000);
         var max = new Vector3i(-2000);
-        packageSectionGeometry(formatSize, output, offsets, result, min, max);
+        packageSectionGeometry(formatSize, sodiumLayout, output, offsets, result, min, max);
 
         Vector3i size;
         {
@@ -52,12 +52,8 @@ public class SodiumResultCompatibility {
     }
 
 
-    private static void copyQuad(long from, long too) {
-        //Quads are 64 bytes big using NvidiumCompactChunkVertex otherwise 80 bytes using CompactChunkVertex
-        long quadSize = Nvidium.config.use_sodium_vertex_format ?
-                CompactChunkVertex.STRIDE * 4 :
-                NvidiumCompactChunkVertex.STRIDE * 4;
-        MemoryUtil.memCopy(from, too, quadSize);
+    private static void copyQuad(long from, long too, int formatSize) {
+        MemoryUtil.memCopy(from, too, formatSize * 4L);
     }
 
     private static int[] computeRanges(int[] segments) {
@@ -77,21 +73,21 @@ public class SodiumResultCompatibility {
         return ranges;
     }
 
-    private static int copyRange(BuiltSectionMeshParts meshData, int offset, int count, long dst, int formatSize, Vector3i min, Vector3i max) {
+    private static int copyRange(BuiltSectionMeshParts meshData, int offset, int count, long dst, int formatSize, boolean sodiumLayout, Vector3i min, Vector3i max) {
         long src = MemoryUtil.memAddress(meshData.getVertexData().getDirectBuffer()) + (long) offset * formatSize;
         MemoryUtil.memCopy(src, dst, (long) count * formatSize);
 
         //Update the meta bits of the model format
         for (int j = 0; j < count; j++) {
             long base = dst + (long) j * formatSize;
-            updateSectionBounds(min, max, base);
+            updateSectionBounds(min, max, base, sodiumLayout);
         }
 
         return count / 4;
     }
 
     //Everything is /6*4 cause its in indices and we want verticies
-    private static void packageSectionGeometry(int formatSize, NativeBuffer output, int[] outOffsets, ChunkBuildOutput result, Vector3i min, Vector3i max) {
+    private static void packageSectionGeometry(int formatSize, boolean sodiumLayout, NativeBuffer output, int[] outOffsets, ChunkBuildOutput result, Vector3i min, Vector3i max) {
         int offset = 0;
         long outPtr = MemoryUtil.memAddress(output.getDirectBuffer());
 
@@ -99,7 +95,7 @@ public class SodiumResultCompatibility {
         var translucentData = result.meshes.get(DefaultTerrainRenderPasses.TRANSLUCENT);
 
         // If we are using sodium translucency sorting, we don't need to sort quads
-        if (translucentData != null && Nvidium.config.translucency_sorting_level == TranslucencySortingLevel.SODIUM) {
+        if (translucentData != null && Nvidium.translucencySortingLevel() == TranslucencySortingLevel.SODIUM) {
             var translucentRanges = computeRanges(translucentData.getVertexSegments());
             for (int i = 0; i < ModelQuadFacing.COUNT; i++) {
                 offset += copyRange(
@@ -108,6 +104,7 @@ public class SodiumResultCompatibility {
                         translucentRanges[i * 2 + 1],
                         outPtr + offset * 4L * formatSize,
                         formatSize,
+                        sodiumLayout,
                         min,
                         max
                 );
@@ -156,7 +153,7 @@ public class SodiumResultCompatibility {
                     long base = src + (long) j * formatSize;
 
                     float x, y, z;
-                    if (Nvidium.config.use_sodium_vertex_format) {
+                    if (sodiumLayout) {
                         int hi = MemoryUtil.memGetInt(base);
                         int lo = MemoryUtil.memGetInt(base + 4);
 
@@ -169,7 +166,7 @@ public class SodiumResultCompatibility {
                         y = decodePosition(MemoryUtil.memGetShort(base + 2));
                         z = decodePosition(MemoryUtil.memGetShort(base + 4));
                     }
-                    updateSectionBounds(min, max, base);
+                    updateSectionBounds(min, max, base, sodiumLayout);
 
                     cx += x;
                     cy += y;
@@ -209,7 +206,7 @@ public class SodiumResultCompatibility {
 
             for (int i = 0; i < sortingData.length; i++) {
                 long data = sortingData[i];
-                copyQuad(srcs[(int) (data&7)] + ((data>>3)&((1L<<29)-1))*4*formatSize, outPtr + ((sortingData.length-1)-i) * 4L * formatSize);
+                copyQuad(srcs[(int) (data&7)] + ((data>>3)&((1L<<29)-1))*4*formatSize, outPtr + ((sortingData.length-1)-i) * 4L * formatSize, formatSize);
             }
             offset += quadCount;
         }
@@ -232,6 +229,7 @@ public class SodiumResultCompatibility {
                         solidRanges[i * 2 + 1],
                         outPtr + offset * 4L * formatSize,
                         formatSize,
+                        sodiumLayout,
                         min,
                         max
                 );
@@ -243,6 +241,7 @@ public class SodiumResultCompatibility {
                         cutoutRanges[i * 2 + 1],
                         outPtr + offset * 4L * formatSize,
                         formatSize,
+                        sodiumLayout,
                         min,
                         max
                 );
@@ -266,10 +265,10 @@ public class SodiumResultCompatibility {
         return (((float)pos) * vertexScale) - 8;
     }
 
-    private static void updateSectionBounds(Vector3i min, Vector3i max, long vertex) {
+    private static void updateSectionBounds(Vector3i min, Vector3i max, long vertex, boolean sodiumLayout) {
         float x, y, z;
 
-        if (Nvidium.config.use_sodium_vertex_format) {
+        if (sodiumLayout) {
             int hi = MemoryUtil.memGetInt(vertex);
             int lo = MemoryUtil.memGetInt(vertex + 4);
 

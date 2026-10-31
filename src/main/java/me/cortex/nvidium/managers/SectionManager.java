@@ -230,7 +230,7 @@ public class SectionManager {
         metadata += 4;
 
         // Reinject or free index data
-        if (Nvidium.config.translucency_sorting_level == TranslucencySortingLevel.SODIUM) {
+        if (Nvidium.translucencySortingLevel() == TranslucencySortingLevel.SODIUM) {
             if (result.containsNewIndexData()) {
                 MemoryUtil.memPutInt(metadata, -1);
 

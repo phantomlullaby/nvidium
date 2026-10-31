@@ -16,6 +16,8 @@ public class CmdBufferBuilder extends Phase {
     }
 
     public void dispatch(int regionCount) {
+        org.lwjgl.opengl.GL41C.glProgramUniform1ui(shader.getId(), org.lwjgl.opengl.GL20C.glGetUniformLocation(shader.getId(), "fixOccludedHistory"),
+                me.cortex.nvidium.RenderPipeline.cullingFix ? 1 : 0);
         shader.bind();
         timing.marker();
         glDispatchCompute(regionCount, 1, 1);

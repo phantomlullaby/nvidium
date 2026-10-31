@@ -5,8 +5,10 @@ import com.mojang.renderpearl.frontend.FrontendRenderPass;
 import it.unimi.dsi.fastutil.ints.*;
 import me.cortex.nvidium.config.StatisticsLoggingLevel;
 import me.cortex.nvidium.config.TranslucencySortingLevel;
+import me.cortex.nvidium.debug.FrameProfiler;
 import me.cortex.nvidium.gl.RenderDevice;
 import me.cortex.nvidium.gl.buffers.IDeviceMappedBuffer;
+import me.cortex.nvidium.iris.IrisCompat;
 import me.cortex.nvidium.managers.RegionManager;
 import me.cortex.nvidium.managers.RegionVisibilityTracker;
 import me.cortex.nvidium.managers.SectionManager;
@@ -107,6 +109,15 @@ public class RenderPipeline {
     private final IDeviceMappedBuffer transformationArray;
     private final IDeviceMappedBuffer originOffsetArray;
 
+    //Only allocated in Iris mode: u_Globals for the pack's terrain programs (main view at 0, shadow view at IRIS_GLOBALS_STRIDE),
+    // and the scene data/commands for the shadow view
+    private static final int IRIS_GLOBALS_STRIDE = 256;
+    private final IDeviceMappedBuffer irisGlobals;
+    private final IDeviceMappedBuffer shadowSceneUniform;
+    private final IDeviceMappedBuffer shadowCommandBuffer;
+    private final IDeviceMappedBuffer shadowSectionSlots;
+    private final IrisDrawBuilder irisDrawBuilder;
+
     private final BitSet regionVisibilityTracker;
 
     //Set of regions that need to be sorted
@@ -142,13 +153,28 @@ public class RenderPipeline {
         sceneUniform = device.createDeviceOnlyMappedBuffer(SCENE_SIZE + maxRegions*2L);
         regionVisibility = device.createDeviceOnlyMappedBuffer(maxRegions);
         sectionVisibility = device.createDeviceOnlyMappedBuffer(maxRegions * 256L);
-        sectionIndices = device.createDeviceOnlyMappedBuffer(maxRegions * 256L * 3L);
+        //u8vec3 entries, which are 4 bytes apart in buffer memory
+        sectionIndices = device.createDeviceOnlyMappedBuffer(maxRegions * 256L * 4L);
         terrainCommandBuffer = device.createDeviceOnlyMappedBuffer(maxRegions*8L);
         translucencyCommandBuffer = device.createDeviceOnlyMappedBuffer(maxRegions*8L);
         temporalCommandBuffer = device.createDeviceOnlyMappedBuffer(maxRegions*8L);
         regionSortingList = device.createDeviceOnlyMappedBuffer(maxRegions*2L);
         this.transformationArray = device.createDeviceOnlyMappedBuffer(RegionManager.MAX_TRANSFORMATION_COUNT * (4*4*4));
         this.originOffsetArray = device.createDeviceOnlyMappedBuffer(RegionManager.MAX_TRANSFORMATION_COUNT * 8);
+
+        if (Nvidium.IRIS_MODE) {
+            irisGlobals = device.createDeviceOnlyMappedBuffer(IRIS_GLOBALS_STRIDE * 2);
+            shadowSceneUniform = device.createDeviceOnlyMappedBuffer(SCENE_SIZE);
+            shadowCommandBuffer = device.createDeviceOnlyMappedBuffer(maxRegions * 8L);
+            shadowSectionSlots = device.createDeviceOnlyMappedBuffer(maxRegions * 256L);
+            irisDrawBuilder = new IrisDrawBuilder(device, uploadStream, maxRegions, IrisCompat.Kind.values().length);
+        } else {
+            shadowSectionSlots = null;
+            irisDrawBuilder = null;
+            irisGlobals = null;
+            shadowSceneUniform = null;
+            shadowCommandBuffer = null;
+        }
 
         regionVisibilityTracker = new BitSet(maxRegions);
         regionVisibilityTracking = new RegionVisibilityTracker(downloadStream, maxRegions);
@@ -194,6 +220,12 @@ public class RenderPipeline {
     }
 
     private int prevRegionCount;
+    private int shadowRegionCount;
+    private int shadowSectionCount;
+    //Section visibility history fixes: occluded regions record "not visible" for their sections, and a region leaving the
+    // frustum clears all 256 of its sections (was 255). Without them a section could be skipped for a frame when it showed up
+    // again, which in VR (eyes alternating viewpoints every render) happens often. Kept switchable for debugging
+    public static boolean cullingFix = true;
     private int frameId;
     private boolean compiledForFog = false;
 
@@ -219,19 +251,6 @@ public class RenderPipeline {
         //  /tp @p 0.0 -1.62 0.0 0 0
         //Clear the first gl error, not our fault
         //glGetError();
-
-        int screenWidth = Minecraft.getInstance().getWindow().getWidth();
-        int screenHeight = Minecraft.getInstance().getWindow().getHeight();
-
-        var textureAtlas = (TextureAtlasAccessor) Minecraft.getInstance()
-                .getTextureManager()
-                .getTexture(TextureAtlas.LOCATION_BLOCKS);
-
-        double subTexelPrecision = (1 << GPULimits.getSubTexelPrecisionBits());
-        double subTexelOffset = 1.0f / CompactChunkVertex.TEXTURE_MAX_VALUE;
-
-        float subTexelWidth = (float)(subTexelOffset - (((1.0D / textureAtlas.nvidium$getWidth()) / subTexelPrecision)));
-        float subTexelHeight = (float)(subTexelOffset - (((1.0D / textureAtlas.nvidium$getHeight()) / subTexelPrecision)));
 
         int visibleRegions = 0;
 
@@ -268,7 +287,7 @@ public class RenderPipeline {
                     if (regionVisibilityTracker.get(i)) {//Going from visible to non visible
                         //Clear the visibility bits
                         if (Nvidium.config.enable_temporal_coherence) {
-                            nglClearNamedBufferSubData(sectionVisibility.getId(), GL_R8UI, (long) i << 8, 255, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
+                            nglClearNamedBufferSubData(sectionVisibility.getId(), GL_R8UI, (long) i << 8, cullingFix ? 256 : 255, GL_RED_INTEGER, GL_UNSIGNED_BYTE, 0);
                         }
                     }
                     regionVisibilityTracker.clear(i);
@@ -295,87 +314,12 @@ public class RenderPipeline {
             }
         }
 
-        {
-            Vector3f delta = new Vector3f((float) (px-(chunkPos.x<<4)), (float) (py-(chunkPos.y<<4)), (float) (pz-(chunkPos.z<<4)));
-            delta.negate();
-            long addr = uploadStream.upload(sceneUniform, 0, SCENE_SIZE);
-            new Matrix4f(crm.projection())
-                    .mul(crm.modelView())
-                    .translate(delta)//Translate the subchunk position
-                    .getToAddress(addr);
-            addr += 4*4*4;
-            if (this.compiledForFog) {
-                new Matrix4f(crm.projection())
-                        .mul(crm.modelView())
-                        .invert()
-                        .getToAddress(addr);
-                addr += 4*4*4;
-            }
-            new Vector4i(chunkPos.x, chunkPos.y, chunkPos.z, 0).getToAddress(addr);//Chunk the camera is in
-            addr += 16;
-            new Vector4f(delta,0).getToAddress(addr);//Subchunk offset (note, delta is already negated)
-            addr += 16;
-            MemoryUtil.memPutLong(addr, sceneUniform.getDeviceAddress() + SCENE_SIZE);//Put in the location of the region indexs
-            addr += 8;
-            MemoryUtil.memPutLong(addr, sectionManager.getRegionManager().getRegionBufferAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, sectionManager.getRegionManager().getSectionBufferAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, regionVisibility.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, sectionVisibility.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, sectionIndices.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, terrainCommandBuffer.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, translucencyCommandBuffer.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, temporalCommandBuffer.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, regionSortingList.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, sectionManager.terrainAreana.buffer.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, sectionManager.terrainAreana.buffer.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, this.transformationArray.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, this.originOffsetArray.getDeviceAddress());
-            addr += 8;
-            MemoryUtil.memPutLong(addr, statisticsBuffer == null?0:statisticsBuffer.getDeviceAddress());//Logging buffer
-            addr += 8;
-            //Convert it into the expected size values and floats
-            MemoryUtil.memPutFloat(addr, ((float)screenWidth)/2);
-            addr += 4;
-            MemoryUtil.memPutFloat(addr, ((float)screenHeight)/2);
-            addr += 4;
-            new Vector4f(fogParameters.red(), fogParameters.green(), fogParameters.blue(), fogParameters.alpha()).getToAddress(addr);
-            addr += 16;
-            new Vector2f(fogParameters.environmentalStart(), fogParameters.environmentalEnd()).getToAddress(addr);
-            addr += 8;
-            new Vector2f(fogParameters.renderStart(), fogParameters.renderEnd()).getToAddress(addr);
-            addr += 8;
-            MemoryUtil.memPutFloat(addr, subTexelWidth);
-            addr += 4;
-            MemoryUtil.memPutFloat(addr, subTexelHeight);
-            addr += 4;
-            MemoryUtil.memPutFloat(addr, 1.0f / textureAtlas.nvidium$getWidth());
-            addr += 4;
-            MemoryUtil.memPutFloat(addr, 1.0f / textureAtlas.nvidium$getHeight());
-            addr += 4;
-            int flags = 0;
-            flags |= SodiumClientMod.options().performance.useBlockFaceCulling?1:0;
-            if (Minecraft.getInstance().options.textureFiltering().get() == TextureFilteringMethod.RGSS)
-                flags |= 2;
-            MemoryUtil.memPutInt(addr, flags);//Flags
-            addr += 4;
-            MemoryUtil.memPutShort(addr, (short) visibleRegions);
-            addr += 2;
-            MemoryUtil.memPutByte(addr, (byte) (frameId++));
+        writeScene(sceneUniform, crm, fogParameters, chunkPos, px, py, pz, visibleRegions, frameId++);
+        if (Nvidium.IRIS_MODE) {
+            writeIrisGlobals(0, crm, fogParameters);
         }
 
-        if (Nvidium.config.translucency_sorting_level == TranslucencySortingLevel.NONE) {
+        if (Nvidium.translucencySortingLevel() == TranslucencySortingLevel.NONE) {
             regionsToSort.clear();
         }
 
@@ -407,9 +351,18 @@ public class RenderPipeline {
         //Bind the uniform, it doesnt get wiped between shader changes
         glBufferAddressRangeNV(GL_UNIFORM_BUFFER_ADDRESS_NV, 0, sceneUniform.getDeviceAddress(), SCENE_SIZE);
 
+        //With the depth pre-pass, the depth of all opaque terrain is drawn first, the color of the PRIMARY and TEMPORAL draws after the TEMPORAL depth
+        boolean depthPrepass = Nvidium.IRIS_MODE && IrisCompat.canDrawDepthPrepass(IrisCompat.Kind.PRIMARY);
+        IrisCompat.Phase opaquePhase = depthPrepass ? IrisCompat.Phase.DEPTH : IrisCompat.Phase.FULL;
+        IrisDrawBuilder.Output primaryDraws = null;
         if (prevRegionCount != 0) {
             glEnable(GL_DEPTH_TEST);
-            terrainRasterizer.raster(pass, prevRegionCount, terrainCommandBuffer.getDeviceAddress(), terrainSampler);
+            if (Nvidium.IRIS_MODE) {
+                primaryDraws = buildIrisDraws(IrisCompat.Kind.PRIMARY, terrainCommandBuffer.getDeviceAddress(), prevRegionCount);
+                drawIris(IrisCompat.Kind.PRIMARY, opaquePhase, pass, 0, primaryDraws);
+            } else {
+                terrainRasterizer.raster(pass, prevRegionCount, terrainCommandBuffer.getDeviceAddress(), terrainSampler);
+            }
             glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
         }
 
@@ -466,11 +419,26 @@ public class RenderPipeline {
         prevRegionCount = visibleRegions;
 
         //Do temporal rasterization
+        IrisDrawBuilder.Output temporalDraws = null;
         if (Nvidium.config.enable_temporal_coherence) {
             glMemoryBarrier(GL_COMMAND_BARRIER_BIT);
-            temporalRasterizer.raster(pass, visibleRegions, temporalCommandBuffer.getDeviceAddress(), terrainSampler);
+            if (Nvidium.IRIS_MODE) {
+                temporalDraws = buildIrisDraws(IrisCompat.Kind.TEMPORAL, temporalCommandBuffer.getDeviceAddress(), visibleRegions);
+                drawIris(IrisCompat.Kind.TEMPORAL, opaquePhase, pass, 0, temporalDraws);
+            } else {
+                temporalRasterizer.raster(pass, visibleRegions, temporalCommandBuffer.getDeviceAddress(), terrainSampler);
+            }
         }
 
+        if (depthPrepass) {
+            //Same draw order as without the pre-pass, so fragments at equal depth still end up the same
+            if (primaryDraws != null) {
+                drawIris(IrisCompat.Kind.PRIMARY, IrisCompat.Phase.COLOR, pass, 0, primaryDraws);
+            }
+            if (temporalDraws != null) {
+                drawIris(IrisCompat.Kind.TEMPORAL, IrisCompat.Phase.COLOR, pass, 0, temporalDraws);
+            }
+        }
 
         {//Do proper visibility tracking
             glDepthMask(false);
@@ -493,6 +461,189 @@ public class RenderPipeline {
         //if ((err = glGetError()) != 0) {
         //    throw new IllegalStateException("GLERROR: "+err);
         //}
+    }
+
+    //Uploads the SceneData block (occlusion/scene.glsl) for a view centered on the camera at px,py,pz
+    private void writeScene(IDeviceMappedBuffer target, ChunkRenderMatrices crm, FogParameters fogParameters, Vector3i chunkPos,
+                            double px, double py, double pz, int visibleRegions, int frameId) {
+        int screenWidth = Minecraft.getInstance().getWindow().getWidth();
+        int screenHeight = Minecraft.getInstance().getWindow().getHeight();
+
+        var textureAtlas = (TextureAtlasAccessor) Minecraft.getInstance()
+                .getTextureManager()
+                .getTexture(TextureAtlas.LOCATION_BLOCKS);
+
+        double subTexelPrecision = (1 << GPULimits.getSubTexelPrecisionBits());
+        double subTexelOffset = 1.0f / CompactChunkVertex.TEXTURE_MAX_VALUE;
+
+        float subTexelWidth = (float)(subTexelOffset - (((1.0D / textureAtlas.nvidium$getWidth()) / subTexelPrecision)));
+        float subTexelHeight = (float)(subTexelOffset - (((1.0D / textureAtlas.nvidium$getHeight()) / subTexelPrecision)));
+
+        {
+            Vector3f delta = new Vector3f((float) (px-(chunkPos.x<<4)), (float) (py-(chunkPos.y<<4)), (float) (pz-(chunkPos.z<<4)));
+            delta.negate();
+            long addr = uploadStream.upload(target, 0, SCENE_SIZE);
+            new Matrix4f(crm.projection())
+                    .mul(crm.modelView())
+                    .translate(delta)//Translate the subchunk position
+                    .getToAddress(addr);
+            addr += 4*4*4;
+            if (this.compiledForFog) {
+                new Matrix4f(crm.projection())
+                        .mul(crm.modelView())
+                        .invert()
+                        .getToAddress(addr);
+                addr += 4*4*4;
+            }
+            new Vector4i(chunkPos.x, chunkPos.y, chunkPos.z, 0).getToAddress(addr);//Chunk the camera is in
+            addr += 16;
+            new Vector4f(delta,0).getToAddress(addr);//Subchunk offset (note, delta is already negated)
+            addr += 16;
+            MemoryUtil.memPutLong(addr, target.getDeviceAddress() + SCENE_SIZE);//Put in the location of the region indexs
+            addr += 8;
+            MemoryUtil.memPutLong(addr, sectionManager.getRegionManager().getRegionBufferAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, sectionManager.getRegionManager().getSectionBufferAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, regionVisibility.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, sectionVisibility.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, sectionIndices.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, terrainCommandBuffer.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, translucencyCommandBuffer.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, temporalCommandBuffer.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, regionSortingList.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, sectionManager.terrainAreana.buffer.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, sectionManager.terrainAreana.buffer.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, this.transformationArray.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, this.originOffsetArray.getDeviceAddress());
+            addr += 8;
+            MemoryUtil.memPutLong(addr, statisticsBuffer == null?0:statisticsBuffer.getDeviceAddress());//Logging buffer
+            addr += 8;
+            //Convert it into the expected size values and floats
+            MemoryUtil.memPutFloat(addr, ((float)screenWidth)/2);
+            addr += 4;
+            MemoryUtil.memPutFloat(addr, ((float)screenHeight)/2);
+            addr += 4;
+            new Vector4f(fogParameters.red(), fogParameters.green(), fogParameters.blue(), fogParameters.alpha()).getToAddress(addr);
+            addr += 16;
+            new Vector2f(fogParameters.environmentalStart(), fogParameters.environmentalEnd()).getToAddress(addr);
+            addr += 8;
+            new Vector2f(fogParameters.renderStart(), fogParameters.renderEnd()).getToAddress(addr);
+            addr += 8;
+            MemoryUtil.memPutFloat(addr, subTexelWidth);
+            addr += 4;
+            MemoryUtil.memPutFloat(addr, subTexelHeight);
+            addr += 4;
+            MemoryUtil.memPutFloat(addr, 1.0f / textureAtlas.nvidium$getWidth());
+            addr += 4;
+            MemoryUtil.memPutFloat(addr, 1.0f / textureAtlas.nvidium$getHeight());
+            addr += 4;
+            int flags = 0;
+            flags |= SodiumClientMod.options().performance.useBlockFaceCulling?1:0;
+            if (Minecraft.getInstance().options.textureFiltering().get() == TextureFilteringMethod.RGSS)
+                flags |= 2;
+            MemoryUtil.memPutInt(addr, flags);//Flags
+            addr += 4;
+            MemoryUtil.memPutShort(addr, (short) visibleRegions);
+            addr += 2;
+            MemoryUtil.memPutByte(addr, (byte) frameId);
+        }
+    }
+
+    //Uploads Iris' sodium u_Globals block (see SodiumTransformer and sodium's UniformBufferManager) at the given offset of irisGlobals
+    private void writeIrisGlobals(int offset, ChunkRenderMatrices crm, FogParameters fogParameters) {
+        var textureAtlas = (TextureAtlasAccessor) Minecraft.getInstance()
+                .getTextureManager()
+                .getTexture(TextureAtlas.LOCATION_BLOCKS);
+        double subTexelPrecision = (1 << GPULimits.getSubTexelPrecisionBits());
+        double subTexelOffset = 1.0f / CompactChunkVertex.TEXTURE_MAX_VALUE;
+
+        long addr = uploadStream.upload(irisGlobals, offset, IrisCompat.GLOBALS_SIZE);
+        MemoryUtil.memSet(addr, 0, IrisCompat.GLOBALS_SIZE);
+        new Matrix4f(crm.projection()).getToAddress(addr);
+        new Matrix4f(crm.modelView()).getToAddress(addr + 64);
+        new Vector4f(fogParameters.red(), fogParameters.green(), fogParameters.blue(), fogParameters.alpha()).getToAddress(addr + 128);
+        new Vector2f(fogParameters.environmentalStart(), fogParameters.environmentalEnd()).getToAddress(addr + 144);
+        new Vector2f(fogParameters.renderStart(), fogParameters.renderEnd()).getToAddress(addr + 152);
+        new Vector2f(1.0f / textureAtlas.nvidium$getWidth(), 1.0f / textureAtlas.nvidium$getHeight()).getToAddress(addr + 160);
+        new Vector2f((float) (subTexelOffset - (((1.0D / textureAtlas.nvidium$getWidth()) / subTexelPrecision))),
+                (float) (subTexelOffset - (((1.0D / textureAtlas.nvidium$getHeight()) / subTexelPrecision)))).getToAddress(addr + 168);
+        MemoryUtil.memPutFloat(addr + 176, (float) (1.0 / (Minecraft.getInstance().options.chunkSectionFadeInTime().get() * 1000.0)));
+        MemoryUtil.memPutInt(addr + 180, Minecraft.getInstance().options.textureFiltering().get() == TextureFilteringMethod.RGSS ? 1 : 0);
+    }
+
+    //Builds the draws of the visible sections listed in a (count, regionId << 8) per region command buffer, the scene data for the
+    // view must be bound. They stay valid until the next build of the same kind
+    private IrisDrawBuilder.Output buildIrisDraws(IrisCompat.Kind kind, long commands, int commandCount) {
+        FrameProfiler.mark(kind.name().toLowerCase(java.util.Locale.ROOT) + ":build");
+        return irisDrawBuilder.build(kind.ordinal(), commands, shadowSectionSlots.getDeviceAddress(), commandCount, kind.mode);
+    }
+
+    //Draws built draws with the shader pack program
+    private void drawIris(IrisCompat.Kind kind, IrisCompat.Phase phase, TerrainRenderPass pass, int globalsOffset, IrisDrawBuilder.Output draws) {
+        String name = kind.name().toLowerCase(java.util.Locale.ROOT);
+        FrameProfiler.mark(name + ":" + phase.name().toLowerCase(java.util.Locale.ROOT));
+        IrisCompat.draw(kind, phase, pass.getAtlas(), irisGlobals, globalsOffset, draws, irisDrawBuilder.getQuadIndexBuffer(),
+                sectionManager.terrainAreana.buffer, Nvidium.VERTEX_STRIDE);
+        FrameProfiler.mark(name + ":rest");
+    }
+
+    //Renders the terrain into the Iris shadow map. There is no occlusion culling here, only frustum culling
+    public void renderShadow(TerrainRenderPass pass, Viewport viewport, FogParameters fogParameters, ChunkRenderMatrices crm, double px, double py, double pz) {
+        var rm = sectionManager.getRegionManager();
+        if (rm.regionCount() == 0) return;
+
+        Vector3i chunkPos = new Vector3i(((int)Math.floor(px))>>4, ((int)Math.floor(py))>>4, ((int)Math.floor(pz))>>4);
+
+        //Sections are frustum culled on the cpu with the shadow frustum Iris made (the same test sodium does for it),
+        // giving a list of visible section slots per region (256 bytes per region in shadowSectionSlots)
+        int regionCount = 0;
+        int sectionCount = 0;
+        long commands = uploadStream.upload(shadowCommandBuffer, 0, rm.maxRegionIndex() * 8L);
+        for (int i = 0; i < rm.maxRegionIndex(); i++) {
+            if (rm.regionExists(i) && rm.isRegionVisible(viewport, i)) {
+                long slots = uploadStream.upload(shadowSectionSlots, (long) i * 256, 256);
+                int sections = rm.writeVisibleSections(viewport, i, slots);
+                if (sections == 0) continue;
+                sectionCount += sections;
+                MemoryUtil.memPutInt(commands, sections);
+                MemoryUtil.memPutInt(commands + 4, i << 8);//First section id
+                commands += 8;
+                regionCount++;
+            }
+        }
+        shadowRegionCount = regionCount;
+        shadowSectionCount = sectionCount;
+        if (regionCount == 0) return;
+
+        writeScene(shadowSceneUniform, crm, fogParameters, chunkPos, px, py, pz, 0, frameId);
+        writeIrisGlobals(IRIS_GLOBALS_STRIDE, crm, fogParameters);
+        sectionManager.commitChanges();
+        uploadStream.commit();
+
+        glEnableClientState(GL_UNIFORM_BUFFER_UNIFIED_NV);
+        glEnableClientState(GL_VERTEX_ATTRIB_ARRAY_UNIFIED_NV);
+        glEnableClientState(GL_ELEMENT_ARRAY_UNIFIED_NV);
+        glEnableClientState(GL_DRAW_INDIRECT_UNIFIED_NV);
+        glBufferAddressRangeNV(GL_UNIFORM_BUFFER_ADDRESS_NV, 0, shadowSceneUniform.getDeviceAddress(), SCENE_SIZE);
+
+        IrisCompat.Kind kind = pass.isTranslucent() ? IrisCompat.Kind.SHADOW_TRANSLUCENT : IrisCompat.Kind.SHADOW_OPAQUE;
+        drawIris(kind, IrisCompat.Phase.FULL, pass, IRIS_GLOBALS_STRIDE, buildIrisDraws(kind, shadowCommandBuffer.getDeviceAddress(), regionCount));
+
+        glDisableClientState(GL_UNIFORM_BUFFER_UNIFIED_NV);
+        glDisableClientState(GL_VERTEX_ATTRIB_ARRAY_UNIFIED_NV);
+        glDisableClientState(GL_ELEMENT_ARRAY_UNIFIED_NV);
+        glDisableClientState(GL_DRAW_INDIRECT_UNIFIED_NV);
     }
 
     void enqueueRegionSort(int regionId) {
@@ -526,7 +677,15 @@ public class RenderPipeline {
         //Translucency sorting
         {
             glEnable(GL_DEPTH_TEST);
-            translucencyTerrainRasterizer.raster(pass, renderPass, prevRegionCount, translucencyCommandBuffer.getDeviceAddress(), terrainSampler, stage);
+            if (Nvidium.IRIS_MODE) {
+                //Shader packs do their own translucency, the improved transparency (OIT) stages other than the final one are skipped
+                if (stage == null || stage == OitStage.ACCUMULATE) {
+                    drawIris(IrisCompat.Kind.TRANSLUCENT, IrisCompat.Phase.FULL, pass, 0,
+                            buildIrisDraws(IrisCompat.Kind.TRANSLUCENT, translucencyCommandBuffer.getDeviceAddress(), prevRegionCount));
+                }
+            } else {
+                translucencyTerrainRasterizer.raster(pass, renderPass, prevRegionCount, translucencyCommandBuffer.getDeviceAddress(), terrainSampler, stage);
+            }
         }
 
         glDisableClientState(GL_UNIFORM_BUFFER_UNIFIED_NV);
@@ -582,6 +741,13 @@ public class RenderPipeline {
         if (statisticsBuffer != null) {
             statisticsBuffer.delete();
         }
+        if (irisGlobals != null) {
+            irisGlobals.delete();
+            shadowSceneUniform.delete();
+            shadowCommandBuffer.delete();
+            shadowSectionSlots.delete();
+            irisDrawBuilder.delete();
+        }
     }
 
     public void addDebugInfo(List<String> info) {
@@ -605,6 +771,10 @@ public class RenderPipeline {
             }
             info.addAll(List.of(builder.toString().split("\n")));
         }
+        if (Nvidium.IRIS_MODE) {
+            info.add("Shadow regions: " + shadowRegionCount + ", sections: " + shadowSectionCount);
+            IrisCompat.addDebugInfo(info);
+        }
         info.add("Primary Terrain frame time: " +  String.format("%.03f", terrainRasterizer.getTiming().getAverageMs()) + "ms");
         info.add("Translucent frame time: " +  String.format("%.03f", translucencyTerrainRasterizer.getTiming().getAverageMs()) + "ms");
         if (Nvidium.config.enable_temporal_coherence) {
@@ -613,7 +783,7 @@ public class RenderPipeline {
         info.add("Region Raster time: " +  String.format("%.03f", regionRasterizer.getTiming().getAverageMs()) + "ms");
         info.add("Section Raster time: " +  String.format("%.03f", sectionRasterizer.getTiming().getAverageMs()) + "ms");
         info.add("CmdBufferBuilder time: " +  String.format("%.03f", cmdBufferBuilder.getTiming().getAverageMs()) + "ms");
-        if (Nvidium.config.translucency_sorting_level != TranslucencySortingLevel.NONE) {
+        if (Nvidium.translucencySortingLevel() != TranslucencySortingLevel.NONE) {
             info.add("SectionSorter time: " +  String.format("%.03f", regionSectionSorter.getTiming().getAverageMs()) + "ms");
         }
     }

@@ -282,6 +282,27 @@ public class RegionManager {
         }
     }
 
+    //Writes the slot (one byte) of every section of the region inside the viewport's frustum, returns how many were written
+    public int writeVisibleSections(Viewport viewport, int regionId, long out) {
+        var region = this.regions[regionId];
+        var vp = ((ViewportAccessor) (Object) viewport);
+        var transform = vp.nvidium$getTransform();
+        var frustum = vp.nvidium$getFrustum();
+        int count = 0;
+        for (int slot = 0; slot < region.count; slot++) {
+            int pos = region.id2pos[slot];
+            if (pos == -1) continue;
+            float minX = ((((region.rx << 3) | (pos & 7)) << 4) - transform.intX) - transform.fracX;
+            float minY = ((((region.ry << 2) | ((pos >> 6) & 3)) << 4) - transform.intY) - transform.fracY;
+            float minZ = ((((region.rz << 3) | ((pos >> 3) & 7)) << 4) - transform.intZ) - transform.fracZ;
+            if (frustum.testAab(minX, minY, minZ, minX + 16, minY + 16, minZ + 16)) {
+                MemoryUtil.memPutByte(out + count, (byte) slot);
+                count++;
+            }
+        }
+        return count;
+    }
+
     public int distance(int regionId, int camChunkX, int camChunkY, int camChunkZ) {
         var region = this.regions[regionId];
         return (Math.abs((region.rx << 3) + 4 - camChunkX) +

@@ -1,0 +1,20 @@
+{
+  "required": true,
+  "package": "me.cortex.nvidium.mixin.profile",
+  "plugin": "me.cortex.nvidium.mixin.profile.ProfileMixinPlugin",
+  "compatibilityLevel": "JAVA_17",
+  "client": [
+    "MixinCompositeRendererProfile",
+    "MixinIrisPipelineProfile",
+    "MixinLevelRendererProfile",
+    "MixinMinecraftProfile",
+    "MixinNullVRHeadMotion",
+    "MixinNullVRQuestEmulation",
+    "MixinOpenVRProfile",
+    "MixinOpenVRStereoRendererProfile",
+    "MixinVRPassHelperProfile"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}
